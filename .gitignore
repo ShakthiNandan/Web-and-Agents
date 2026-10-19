@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Agent Hub runtime data, database, and credentials
+.agent-hub/
+hub.db
+hub.db-wal
+hub.db-shm
+token
+client.json
+
+# Environment variables and secrets
+.env
+.env.local
+*.secret
+*.key
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Logs
+*.log
+logs/
+
+# Testing artifacts
+.pytest_cache/
+
+# OS and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
