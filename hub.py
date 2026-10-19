@@ -342,8 +342,14 @@ const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&g
 const ago=s=>s<60?s+'s ago':s<3600?Math.floor(s/60)+'m ago':Math.floor(s/3600)+'h ago';
 let agent='',lastId=0,readOnly=false,openT=new Set(),tasksSig='',sendSig='';const MAXEV=1000;
 async function api(path,opts){const r=await fetch(base+path,opts);if(!r.ok)throw new Error(r.status);return r.json()}
-function evHtml(e){const d=e.data?`<details><summary>${esc(e.msg)}</summary><pre>${esc(JSON.stringify(e.data,null,1))}</pre></details>`:esc(e.msg);
-return `<div class="${esc(e.level)}"><span class=mut>${esc(e.ts.slice(11,19))} ${esc(e.agent_id)}</span> ${d}</div>`}
+function evHtml(e){
+ let main = esc(e.msg);
+ if(e.msg && e.msg.includes(' | Task: ')){
+  const pts = e.msg.split(' | Task: ');
+  main = `<b style="color:var(--acc)">${esc(pts[0])}</b> <span class="mut sm">🎯 ${esc(pts[1])}</span>`;
+ }
+ const d=e.data?`<details><summary>${main}</summary><pre>${esc(JSON.stringify(e.data,null,1))}</pre></details>`:main;
+ return `<div class="${esc(e.level)}" style="padding:2px 0"><span class=mut>${esc(e.ts.slice(11,19))} ${esc(e.agent_id)}</span> ${d}</div>`}
 function applyQ(n){const q=$('q').value.toLowerCase();n.hidden=!!q&&!n.textContent.toLowerCase().includes(q)}
 async function pullEvents(reset){
  if(reset){lastId=0;$('events').innerHTML=''}
@@ -358,7 +364,29 @@ async function pullEvents(reset){
  if(stick)el.scrollTop=el.scrollHeight}
 async function pullState(){
  const s=await api('api/state?events=0');readOnly=s.read_only;$('ro').hidden=!readOnly;
- $('agents').innerHTML=s.agents.map(a=>`<div class="card ${a.id===agent?'sel':''}" data-id="${esc(a.id)}"><span class="dot ${a.online?'on':''}"></span><b>${esc(a.name)}</b> <span class=mut>${esc(a.id)}</span>${a.monitor_only?' <span class=tag>monitor</span>':''}<br><span class="mut sm">${esc(a.status)} · seen ${ago(a.seconds_since_seen)} · q:${a.pending_tasks} run:${a.running_tasks}</span>${a.last_event?`<br><span class="${esc(a.last_event.level)} sm">${esc((a.last_event.msg||'').slice(0,100))}</span>`:''}</div>`).join('')||'<span class=mut>no agents yet</span>';
+ $('agents').innerHTML=s.agents.map(a=>{
+  const le=a.last_event;
+  const isBusy = a.status==='busy';
+  const stBadge = `<span class="tag" style="${isBusy?'color:var(--warn);border-color:var(--warn);font-weight:bold':(a.status==='idle'?'color:var(--ok);border-color:var(--ok)':'')}">${esc(a.status)}</span>`;
+  let info = '';
+  if(le && le.msg){
+   const parts = le.msg.split(' | Task: ');
+   const action = parts[0];
+   const task = parts[1] || '';
+   info = `<div style="margin-top:6px;padding:6px;background:var(--bg);border-radius:6px;border:1px solid var(--bd)">
+     ${task ? `<div class="sm" style="font-weight:600;color:var(--fg);margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(task)}">🎯 ${esc(task)}</div>` : ''}
+     <div class="sm" style="color:var(--acc);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(action)}">⚡ ${esc(action)}</div>
+   </div>`;
+  }
+  return `<div class="card ${a.id===agent?'sel':''}" data-id="${esc(a.id)}">
+   <div style="display:flex;justify-content:space-between;align-items:center">
+     <div><span class="dot ${a.online?'on':''}"></span><b>${esc(a.name)}</b></div>
+     ${stBadge}
+   </div>
+   <div class="mut sm" style="margin:2px 0 4px">${esc(a.id)} · seen ${ago(a.seconds_since_seen)}</div>
+   ${info}
+  </div>`;
+ }).join('')||'<span class=mut>no agents yet</span>';
  const sendable=s.agents.filter(a=>!a.monitor_only);$('sendbox').hidden=readOnly||!sendable.length;
  const sig=sendable.map(a=>a.id).join('|');
  if(sig!==sendSig){sendSig=sig;const cur=$('sagent').value;$('sagent').innerHTML=sendable.map(a=>`<option value="${esc(a.id)}">${esc(a.name)} (${esc(a.id)})</option>`).join('');if(cur)$('sagent').value=cur}
