@@ -592,7 +592,52 @@ def make_handler(store, token, read_only):
                 claim = q.get("claim", ["1"])[0] != "0"
                 return self._send(200, {"tasks": store.claim_tasks(rest[1], claim)})
             if rest == ["mcp"]:
-                return self._send(405, {"error": "SSE stream not offered"}, extra={"Allow": "POST"})
+                accept = self.headers.get("Accept", "")
+                if "text/event-stream" in accept:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    post_url = f"/{token}/mcp"
+                    try:
+                        self.wfile.write(f"event: endpoint\r\ndata: {post_url}\r\n\r\n".encode())
+                        self.wfile.flush()
+                        while True:
+                            time.sleep(15)
+                            self.wfile.write(b": keep-alive\r\n\r\n")
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    return
+                if "text/html" in accept:
+                    dash_url = f"/{token}/"
+                    html = f"""<!doctype html><html><head><meta charset=utf-8><title>agent-hub · MCP Endpoint</title>
+<style>body{{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0f1115;color:#e6e6e6;padding:24px;line-height:1.6}}
+a{{color:#58a6ff;text-decoration:none}}a:hover{{text-decoration:underline}}
+code{{background:#171a21;border:1px solid #262a33;padding:2px 6px;border-radius:4px}}
+.card{{background:#171a21;border:1px solid #262a33;border-radius:8px;padding:16px;margin:16px 0;max-width:640px}}
+.btn{{display:inline-block;background:#238636;color:#fff;padding:8px 14px;border-radius:6px;font-weight:600;margin-top:8px}}
+</style></head><body>
+<h2>agent-hub · MCP Connector Endpoint</h2>
+<div class=card>
+<p><b>You reached the machine-to-machine MCP endpoint.</b></p>
+<p>This endpoint communicates with Claude using JSON-RPC via HTTP POST (or SSE stream).</p>
+<p>Looking for the interactive dashboard?</p>
+<a class=btn href="{dash_url}">👉 Open Web Dashboard</a>
+</div>
+<div class=card>
+<h3>How to connect Claude:</h3>
+<ol>
+<li>Go to <b>Claude.ai</b> &gt; <b>Settings</b> &gt; <b>Connectors</b> &gt; <b>Add custom connector</b></li>
+<li>Set the Connector URL to: <code>{self.path}</code></li>
+<li>Enable the connector in your chat settings.</li>
+</ol>
+</div>
+</body></html>"""
+                    return self._send(200, html, "text/html; charset=utf-8")
+                return self._send(405, {"error": "SSE stream not offered", "message": "Use HTTP POST for JSON-RPC messages or connect with Accept: text/event-stream for SSE."}, extra={"Allow": "POST, GET"})
             self._send(404, {"error": "not found"})
 
         def do_DELETE(self):
