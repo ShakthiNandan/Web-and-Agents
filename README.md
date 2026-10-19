@@ -1,11 +1,13 @@
 # agent-hub
 
-Local agents (and your Antigravity IDE) report to a hub on your laptop. Claude reads them, and queues tasks for the ones that can take them, through MCP over Tailscale Funnel. You watch and control the same data in a web dashboard.
+Local agents (and your Antigravity IDE, OpenCode, Claude Code, OpenAI Codex, or Cline) report to and can be controlled from a hub on your laptop. Claude reads them, monitors execution, and runs tasks across supported coding agents through MCP over Tailscale Funnel. You watch and control the same data in a real-time web dashboard.
+
 Python 3.8+, stdlib only, no install. Windows, macOS, Linux.
 
 ```
-agents / Antigravity hooks --POST /report--> hub (127.0.0.1:8080) <--MCP over Funnel-- Claude
-agents <--GET /tasks/<id>--/                 dashboard at /<token>/   (read, filter, send tasks)
+agents / IDE hooks / CLIs --POST /report--> hub (127.0.0.1:8080) <--MCP over Funnel-- Claude
+agents <--GET /tasks/<id>--/                 dashboard at /<token>/   (control, filter, run agents)
+hub --> launches agy, opencode, claude, codex, cline
 ```
 
 ## Run
@@ -23,9 +25,81 @@ Stop exposing: `tailscale funnel reset`. On Windows use `python` instead of `pyt
 
 claude.ai > Settings > Connectors > Add custom connector
 URL: `https://<laptop>.<tailnet>.ts.net/<token>/mcp` (no OAuth). Name it e.g. `agent-hub`, enable it in the chat.
-Install `agent-hub.skill` so Claude knows the workflow.
+Install `agent-hub.skill` (packaged via `python package_skill.py`) so Claude knows the workflow.
 
-## Antigravity IDE -> hub (new)
+---
+
+## Multi-Agent Adapter Architecture
+
+`agent-hub` provides a provider-neutral agent adapter architecture. Antigravity (AGY) remains fully supported with backward-compatible tooling, and other coding agents are integrated through specialized CLI adapters.
+
+### Provider Capability Matrix
+
+| Provider ID | Provider Name | Default CLI | Detection / Fallback | Headless Task | Background Launch | Interactive Terminal | Model Selection | Auto Approve | Config Env Var |
+|---|---|---|---|:---:|:---:|:---:|:---:|:---:|---|
+| `agy` | **Antigravity** | `agy` / `agy.exe` | `%LOCALAPPDATA%\agy\bin`, PATH | ✅ (`-p`) | ✅ (`-p`) | ✅ (`-i` / interactive) | ✅ (`--model`) | ✅ (`--dangerously-skip-permissions`) | `AGENT_HUB_AGY_BIN` |
+| `opencode` | **OpenCode** | `opencode` / `opencode.cmd` | `%APPDATA%\npm`, PATH | ✅ (`run`) | ✅ (`run`) | ✅ (`--prompt` / interactive) | ✅ (`--model`) | ✅ (`--auto`) | `AGENT_HUB_OPENCODE_BIN` |
+| `claude` | **Claude Code** | `claude` / `claude.cmd` | PATH | ✅ (`-p`) | ✅ (`-p`) | ✅ (interactive) | ✅ (`--model`) | ✅ (`--dangerously-skip-permissions`) | `AGENT_HUB_CLAUDE_BIN` |
+| `codex` | **OpenAI Codex CLI** | `codex` / `codex.exe` | PATH | ✅ (`exec`) | ✅ (`exec`) | ✅ (interactive) | ✅ (`--model`) | N/A | `AGENT_HUB_CODEX_BIN` |
+| `cline` | **Cline CLI** | `cline` / `cline.cmd` | PATH | ✅ (`task`) | ✅ (`task`) | ✅ (interactive) | ✅ (`--model`) | N/A | `AGENT_HUB_CLINE_BIN` |
+
+*Default provider can be configured using `AGENT_HUB_DEFAULT_PROVIDER` (defaults to `agy`).*
+
+### Graceful Unavailable Handling
+
+Agents are not assumed to share identical CLI commands or to be pre-installed on every system:
+- Detection inspects PATH and standard install directories on startup and on demand.
+- Executables not found are gracefully marked as `is_available: false` with the exact missing binary name and installation instructions.
+- Attempting to run an unavailable provider returns a structured error (`{"status": "unavailable", "returncode": -1, ...}`) instead of raising an unhandled exception or crashing the hub.
+- The web dashboard disables unavailable providers in the launcher dropdown and shows their status badges and install commands.
+
+---
+
+## Local Prerequisites & CLI Installation
+
+### 1. Antigravity (AGY)
+- Included with the Google Antigravity IDE / CLI distribution.
+- Binary: `agy` / `agy.exe`.
+- Wire IDE hooks to report tool use:
+  ```bash
+  python antigravity/install_antigravity.py
+  ```
+
+### 2. OpenCode
+- Autonomous open-source AI software engineering agent.
+- Prerequisites: Node.js 18+.
+- Install globally via npm:
+  ```bash
+  npm install -g @opencode/cli
+  ```
+
+### 3. Claude Code
+- Anthropic's agentic terminal coding assistant.
+- Prerequisites: Node.js 18+, `ANTHROPIC_API_KEY`.
+- Install globally via npm:
+  ```bash
+  npm install -g @anthropic-ai/claude-code
+  ```
+
+### 4. OpenAI Codex CLI
+- Prerequisites: OpenAI API key (`OPENAI_API_KEY`).
+- Install or point to your Codex binary:
+  ```bash
+  export AGENT_HUB_CODEX_BIN=/path/to/codex
+  ```
+
+### 5. Cline CLI
+- Prerequisites: Node.js 18+.
+- Install globally via npm:
+  ```bash
+  npm install -g cline
+  ```
+
+See [docs/providers.md](docs/providers.md) for full provider documentation and parameter details.
+
+---
+
+## Antigravity IDE -> hub Hooks
 
 Antigravity runs hook scripts at points in its agent loop. `antigravity/agy_hook.py` turns them into hub events.
 
@@ -41,22 +115,25 @@ Restart Antigravity, run any agent task, and an agent named `Antigravity: <works
 What gets reported: run started / each model call (debug), every tool call with a short summary and trimmed arguments (click an event in the dashboard to expand), errors, and run finished with the termination reason.
 Set `AGENT_HUB_AGY_TAIL=1` in the environment Antigravity starts with to also attach the last transcript lines on finish.
 
-Limits, read these:
+Limits:
 - **Monitor-only.** Antigravity hooks can observe but cannot receive instructions, so `send_task` to an `agy-*` agent is refused (hub and dashboard both). Claude can see what the IDE agent is doing; it cannot drive it.
 - Online/offline: monitor-only agents only speak when active, so they count as online for 30 min after the last event instead of 60 s.
 - Hooks run synchronously in the agent loop; the script has a 2 s network timeout and swallows all errors, so a dead hub never breaks the IDE.
-- Hooks are installed for `PreInvocation`, `PostToolUse` and `Stop` only. `PreToolUse` is deliberately skipped: its response can allow/deny a tool, and a logger should not be in that path.
-- Obvious secrets (keys named like key/token/secret/password, and common API-key patterns) are redacted from tool args, but file paths, commands and code snippets are sent as-is. Treat the hub DB (`~/.agent-hub/hub.db`) as sensitive.
-- Hook format follows Antigravity's public docs and community write-ups (global `~/.gemini/config/hooks.json`, workspace `.agents/hooks.json`). It was tested here with simulated payloads, not inside a live Antigravity. After installing, ask Antigravity "Which hooks are installed?" to confirm it sees `agent-hub`.
+
+---
 
 ## Dashboard
 
 Open `http://127.0.0.1:8080/<token>/` locally (or the same path on your Funnel URL).
-- Agent cards: online dot, status, queue counts, last event. Click a card to filter events to that agent.
-- Events: level filter, text filter, pause, clear view; incremental loading (no flicker); events with details expand in place.
-- Send task form (hidden with `--read-only` or when only monitor-only agents exist); tasks table with output and cancel for pending tasks.
+- **Coding agent execution**: Select agent provider (`Antigravity`, `OpenCode`, `Claude Code`, `OpenAI Codex`, `Cline`), type a prompt, and run in background, run synchronously, or open a live terminal.
+- **Provider cards**: View installed/available providers, versions, and capabilities.
+- **Agent cards**: Online dot, status, queue counts, last event. Click a card to filter events to that agent.
+- **Events**: Level filter, text filter, pause, clear view; incremental loading (no flicker); events with details expand in place.
+- **Tasks**: Send task form and tasks table with status and output.
 
-## Wire up other agents
+---
+
+## Wire up custom task agents
 
 ```bash
 export AGENT_HUB_URL=http://127.0.0.1:8080/<token>      # Windows: set AGENT_HUB_URL=...
@@ -69,28 +146,46 @@ hub = Hub("my-agent", name="My agent")
 hub.report("started", status="busy")
 hub.run(lambda task: do_work(task["text"]))             # executes tasks Claude sends
 ```
-Any language works: it is two HTTP calls (`POST /report`, `GET /tasks/<id>` + `POST /tasks/<n>/result`).
-Pass `"readonly": true` in a report to mark an agent monitor-only.
-Agent is "online" if it reported or polled in the last 60 s.
 
-## MCP tools
+---
 
-`list_agents`, `read_events(agent_id?, since_id?, limit?, level?)`, `list_tasks`, `get_task`,
-`send_task(agent_id, text)`, `cancel_task`. `--read-only` removes the last two (and disables the dashboard send form).
+## MCP Tools
 
-## Security
+### Multi-Agent Tools
+- `list_providers`: List supported agent adapters with availability, paths, versions, and capabilities.
+- `run_agent_task(prompt, provider?, workspace?, timeout?, model?, auto_approve?)`: Run a synchronous task with any provider and wait for output.
+- `launch_agent_background(prompt, provider?, workspace?, model?, auto_approve?)`: Spawn a background headless session and return PID immediately.
+- `open_agent_terminal(provider?, workspace?, prompt?)`: Open a visible terminal window running the interactive CLI.
 
-- Funnel is public internet. The secret path (256-bit token) is the only gate: treat the URL like a password.
-  Rotate: `python hub.py --rotate-token`, then update the connector URL, `AGENT_HUB_URL`, and re-run `install_antigravity.py` (it stores the token in `~/.agent-hub/client.json`).
-- Hub never executes anything. `send_task` only queues text; your agent decides what to do with it.
-  Do not wire `handler` to `subprocess(shell=True)` without an allowlist.
-- Agent log text is untrusted input to Claude (prompt-injection surface); the skill tells Claude to treat it as data. This matters more for Antigravity: its tool args can contain text from web pages or files it read.
-- Binds 127.0.0.1 only. Tokens appear in URLs, so keep proxy/access logs private.
+### Backward-Compatible Antigravity Tools
+- `run_antigravity_task(prompt, workspace?, timeout?)`: Synchronous headless Antigravity task.
+- `launch_antigravity_background(prompt, workspace?)`: Headless background Antigravity session.
+- `open_antigravity_terminal(workspace?, prompt?)`: Interactive visible terminal for Antigravity.
 
-## Upgrading from 0.1.0
+### Monitoring & Task Tools
+- `list_agents`: List agents reporting to the hub.
+- `read_events(agent_id?, since_id?, limit?, level?)`: Read incremental agent events.
+- `list_tasks`, `get_task`, `send_task`, `cancel_task`: Manage queued tasks.
 
-Drop in the new files. The existing `~/.agent-hub/hub.db` is migrated automatically; token unchanged.
+---
 
-## Test
+## Security & Safe Argument Handling
 
-`python tests/smoke_test.py` (starts a throwaway hub; covers REST, MCP, dashboard API, the Antigravity hook and the monitor-only rules).
+- **No Shell Injection**: Process execution uses strict argument arrays passed to `subprocess.run` / `subprocess.Popen` (no `shell=True`). Terminal commands are escaped safely with `-LiteralPath` and single-quote neutralization.
+- **No Secret Logging**: Sensitive credentials (API keys `sk-...`, `ghp_...`, Bearer tokens, passwords, and tokens) are automatically redacted from logs, event payloads, and tool outputs.
+- **Authentication**: All endpoints require the 256-bit secret token in the URL path. Rotate via `python hub.py --rotate-token`.
+- **Local Binding**: Binds to `127.0.0.1` only. Tailscale Funnel securely exposes the port over HTTPS.
+
+---
+
+## Tests
+
+Run the full test suite (stdlib only, mocked executables so external CLIs are not required):
+
+```bash
+# Adapter unit tests (capabilities, detection, safe argument handling, secret redaction, mocking)
+python tests/test_adapters.py
+
+# End-to-end smoke test (spawns throwaway hub, tests REST, MCP, dashboard API, hooks, and providers)
+python tests/smoke_test.py
+```

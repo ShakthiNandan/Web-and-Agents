@@ -91,7 +91,25 @@ try:
 
     # MCP basics
     check("mcp initialize", mcp("initialize", {"protocolVersion": "2025-06-18"})["result"]["serverInfo"]["name"] == "agent-hub")
-    check("mcp tools/list", {t["name"] for t in mcp("tools/list")["result"]["tools"]} >= {"list_agents", "read_events", "send_task"})
+    check("mcp tools/list", {t["name"] for t in mcp("tools/list")["result"]["tools"]} >= {"list_agents", "read_events", "send_task", "list_providers", "run_agent_task", "launch_agent_background", "open_agent_terminal", "run_antigravity_task"})
+
+    # Multi-agent providers REST & MCP
+    prov_st, prov_body = call("GET", "/api/providers")
+    check("GET api/providers", prov_st == 200 and len(prov_body.get("providers", [])) >= 5)
+    state_st, state_body = call("GET", "/api/state?events=0")
+    check("GET api/state includes providers", "providers" in state_body and len(state_body["providers"]) >= 5)
+
+    err, txt = tool("list_providers")
+    prov_dict = {p["id"]: p for p in json.loads(txt).get("providers", [])}
+    check("mcp list_providers returns all 5 adapters", set(prov_dict.keys()) >= {"agy", "opencode", "claude", "codex", "cline"})
+    check("mcp list_providers capabilities explicit", all("capabilities" in p and len(p["capabilities"]) > 0 for p in prov_dict.values()))
+
+    err, txt = tool("run_agent_task", {"provider": "claude", "prompt": "test prompt"})
+    claude_res = json.loads(txt)
+    check("run_agent_task unavailable provider handled gracefully", not err and claude_res.get("status") == "unavailable")
+
+    # Antigravity backward-compatible tool list check
+    check("backward compatible agy tools present", {"run_antigravity_task", "launch_antigravity_background", "open_antigravity_terminal"} <= {t["name"] for t in mcp("tools/list")["result"]["tools"]})
 finally:
     hub.terminate()
 

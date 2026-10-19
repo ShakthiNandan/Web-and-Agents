@@ -17,8 +17,9 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from adapters import get_registry, redact_secrets
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HOME = Path(os.environ.get("AGENT_HUB_HOME", Path.home() / ".agent-hub"))
 ONLINE_SECS = 60
 ONLINE_SECS_PASSIVE = 1800  # monitor-only agents (e.g. IDE hooks) only speak when active
@@ -179,12 +180,32 @@ def tool_defs(read_only):
         ("list_tasks", "List tasks sent to agents, newest first.",
          obj({"agent_id": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "running", "done", "failed", "cancelled"]}, "limit": {"type": "integer"}})),
         ("get_task", "Get one task including its output.", obj({"task_id": {"type": "integer"}}, ["task_id"])),
+        ("list_providers", "List all supported coding agent providers (Antigravity, OpenCode, Claude Code, OpenAI Codex, Cline) with installation status, paths, versions, and capabilities.",
+         obj({"provider": {"type": "string", "description": "Optional specific provider ID to inspect ('agy', 'opencode', 'claude', 'codex', 'cline')"}})),
     ]
     if not read_only:
         tools += [
             ("send_task", "Queue a task (plain-text instruction) for an agent. The agent polls and executes it; returns task_id. Confirm with the user before sending anything destructive.",
              obj({"agent_id": {"type": "string"}, "text": {"type": "string"}}, ["agent_id", "text"])),
             ("cancel_task", "Cancel a task that is still pending (not yet claimed by the agent).", obj({"task_id": {"type": "integer"}}, ["task_id"])),
+            ("run_agent_task", "Run a task synchronously with a coding agent CLI (agy, opencode, claude, codex, cline) and wait for completion. Returns final output.",
+             obj({"prompt": {"type": "string", "description": "Instruction or task prompt for the agent"},
+                  "provider": {"type": "string", "description": "Agent provider ('agy', 'opencode', 'claude', 'codex', 'cline'). Defaults to default provider or agy"},
+                  "workspace": {"type": "string", "description": "Target workspace directory path (optional)"},
+                  "timeout": {"type": "integer", "description": "Max seconds to wait (default 60, max 600)"},
+                  "model": {"type": "string", "description": "Model override if supported by provider"},
+                  "auto_approve": {"type": "boolean", "description": "Auto-approve tool permissions if supported (default true)"}}, ["prompt"])),
+            ("launch_agent_background", "Spawn a headless agent session in the background running a prompt with the chosen provider (agy, opencode, claude, codex, cline). Returns PID immediately so you can monitor progress via read_events.",
+             obj({"prompt": {"type": "string", "description": "Instruction or task prompt for the agent"},
+                  "provider": {"type": "string", "description": "Agent provider ('agy', 'opencode', 'claude', 'codex', 'cline'). Defaults to default provider or agy"},
+                  "workspace": {"type": "string", "description": "Target workspace directory path (optional)"},
+                  "model": {"type": "string", "description": "Model override if supported by provider"},
+                  "auto_approve": {"type": "boolean", "description": "Auto-approve tool permissions if supported (default true)"}}, ["prompt"])),
+            ("open_agent_terminal", "Open a visible interactive terminal window running the specified agent on the user desktop.",
+             obj({"provider": {"type": "string", "description": "Agent provider ('agy', 'opencode', 'claude', 'codex', 'cline'). Defaults to agy"},
+                  "workspace": {"type": "string", "description": "Target workspace directory path (optional)"},
+                  "prompt": {"type": "string", "description": "Optional initial prompt to run"}})),
+            # Antigravity-specific tools retained for exact backward compatibility
             ("launch_antigravity_background", "Spawn a headless Antigravity session in the background running a prompt. Returns PID immediately so you can monitor progress via read_events.",
              obj({"prompt": {"type": "string", "description": "Instruction or task for Antigravity"},
                   "workspace": {"type": "string", "description": "Target workspace directory path (optional)"}}, ["prompt"])),
@@ -210,7 +231,16 @@ def call_tool(store, read_only, name, a):
         t = store.get_task(int(a["task_id"]))
         if not t: raise ValueError("no such task")
         return {"note": UNTRUSTED, "task": t}
-    if read_only and name in ("send_task", "cancel_task", "launch_antigravity_background", "run_antigravity_task", "open_antigravity_terminal"):
+    if name == "list_providers":
+        pid = a.get("provider")
+        providers = get_registry().list_providers()
+        if pid:
+            providers = [p for p in providers if p.provider_id.lower() == str(pid).strip().lower()]
+            if not providers:
+                raise ValueError(f"unknown provider '{pid}'")
+        return {"providers": [p.to_dict() for p in providers]}
+    if read_only and name in ("send_task", "cancel_task", "launch_antigravity_background", "run_antigravity_task", "open_antigravity_terminal",
+                              "run_agent_task", "launch_agent_background", "open_agent_terminal"):
         raise ValueError("hub is running read-only")
     if name == "send_task":
         aid = a["agent_id"]
@@ -221,47 +251,76 @@ def call_tool(store, read_only, name, a):
     if name == "launch_antigravity_background":
         prompt = a.get("prompt", "")
         ws = a.get("workspace") or os.environ.get("WORKSPACE") or str(Path.cwd())
-        cmd = ["agy", "-p", prompt]
-        try:
-            proc = subprocess.Popen(cmd, cwd=ws, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            store.report("hub", level="info", msg=f"Launched background Antigravity session (PID {proc.pid}) in {ws}")
-            return {"status": "started", "pid": proc.pid, "workspace": ws, "note": "Antigravity is running in background. Use read_events to follow tool calls."}
-        except Exception as e:
-            return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        clean_p = redact_secrets(prompt)
+        res = get_registry().launch_background("agy", prompt=prompt, workspace=ws)
+        if res.pid:
+            store.report("hub", level="info", msg=f"Launched background Antigravity session (PID {res.pid}) in {res.workspace} | Task: {clean_p[:60]}")
+            return {"status": "started", "pid": res.pid, "workspace": res.workspace, "note": "Antigravity is running in background. Use read_events to follow tool calls."}
+        return {"status": "error", "error": res.error or "Failed to start Antigravity"}
     if name == "run_antigravity_task":
         prompt = a.get("prompt", "")
         ws = a.get("workspace") or os.environ.get("WORKSPACE") or str(Path.cwd())
         timeout = min(int(a.get("timeout") or 60), 300)
-        store.report("hub", level="info", msg=f"Running Antigravity task in {ws} (timeout {timeout}s)...")
-        try:
-            res = subprocess.run(["agy", "-p", prompt], cwd=ws, capture_output=True, text=True, timeout=timeout, check=False)
-            out = (res.stdout + "\n" + res.stderr).strip()[:10000]
-            return {"status": "completed", "returncode": res.returncode, "output": out}
-        except subprocess.TimeoutExpired:
+        clean_p = redact_secrets(prompt)
+        store.report("hub", level="info", msg=f"Running Antigravity task in {ws} (timeout {timeout}s)... | Task: {clean_p[:60]}")
+        res = get_registry().run_task("agy", prompt=prompt, workspace=ws, timeout=timeout)
+        if res.status == "timeout":
             return {"status": "timeout", "note": f"Task exceeded {timeout}s; check read_events for progress."}
-        except Exception as e:
-            return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        if res.status == "completed":
+            return {"status": "completed", "returncode": res.returncode, "output": res.output or ""}
+        return {"status": "error", "error": res.error or f"Exited with code {res.returncode}"}
     if name == "open_antigravity_terminal":
         ws = a.get("workspace") or os.environ.get("WORKSPACE") or str(Path.cwd())
         prompt = a.get("prompt", "").strip()
-        if prompt:
-            safe_p = prompt.replace("'", "''")
-            ps_body = f"Set-Location -LiteralPath '{ws}'; & agy -i '{safe_p}'"
-        else:
-            ps_body = f"Set-Location -LiteralPath '{ws}'; & agy"
-        
-        # Native Windows console window (bypasses WindowsTerminal.exe 0xc0000142 UWP crash)
-        CREATE_NEW_CONSOLE = 0x00000010
-        try:
-            subprocess.Popen(
-                ["powershell.exe", "-NoExit", "-Command", f"& {{ {ps_body} }}"],
-                cwd=ws,
-                creationflags=CREATE_NEW_CONSOLE
-            )
-        except Exception:
-            subprocess.Popen(f'start "Antigravity" cmd /k "cd /d \\"{ws}\\" && agy' + (f' -i "{prompt}"' if prompt else ''), shell=True)
+        res = get_registry().open_terminal("agy", workspace=ws, prompt=prompt)
         store.report("hub", level="info", msg=f"Opened visible Antigravity terminal in {ws}")
         return {"status": "terminal_opened", "workspace": ws}
+    if name == "run_agent_task":
+        provider = a.get("provider")
+        prompt = a.get("prompt", "")
+        ws = a.get("workspace") or os.environ.get("WORKSPACE") or str(Path.cwd())
+        timeout = min(int(a.get("timeout") or 60), 600)
+        model = a.get("model")
+        auto_approve = a.get("auto_approve", True)
+        clean_p = redact_secrets(prompt)
+        store.report("hub", level="info", msg=f"Running {provider or 'default'} task in {ws} (timeout {timeout}s)... | Task: {clean_p[:60]}")
+        res = get_registry().run_task(
+            provider_id=provider,
+            prompt=prompt,
+            workspace=ws,
+            timeout=timeout,
+            model=model,
+            auto_approve=auto_approve,
+        )
+        return res.to_dict()
+    if name == "launch_agent_background":
+        provider = a.get("provider")
+        prompt = a.get("prompt", "")
+        ws = a.get("workspace") or os.environ.get("WORKSPACE") or str(Path.cwd())
+        model = a.get("model")
+        auto_approve = a.get("auto_approve", True)
+        clean_p = redact_secrets(prompt)
+        res = get_registry().launch_background(
+            provider_id=provider,
+            prompt=prompt,
+            workspace=ws,
+            model=model,
+            auto_approve=auto_approve,
+        )
+        if res.pid:
+            store.report("hub", level="info", msg=f"Launched background {res.provider} session (PID {res.pid}) in {res.workspace} | Task: {clean_p[:60]}")
+        return res.to_dict()
+    if name == "open_agent_terminal":
+        provider = a.get("provider")
+        ws = a.get("workspace") or os.environ.get("WORKSPACE") or str(Path.cwd())
+        prompt = a.get("prompt", "").strip()
+        res = get_registry().open_terminal(
+            provider_id=provider,
+            workspace=ws,
+            prompt=prompt,
+        )
+        store.report("hub", level="info", msg=f"Opened visible {res.provider} terminal in {ws}")
+        return res.to_dict()
     raise KeyError(name)
 
 
@@ -315,14 +374,18 @@ pre{margin:4px 0;padding:6px;background:var(--bg);border:1px solid var(--bd);bor
 table{width:100%;border-collapse:collapse}td{border-top:1px solid var(--bd);padding:4px 6px;vertical-align:top}
 </style><body><b>agent-hub</b> <span class=mut id=ts></span> <span class=tag id=ro hidden>read-only</span>
 <h2>agents <span class=mut id=filt></span></h2><div class=grid id=agents></div>
-<h2>tools (mcp) <span class=mut id=tcount></span></h2>
+<h2>coding agent execution <span class=mut id=pavail></span></h2>
 <div class=bar style="margin-bottom:6px">
-<input id=agyprompt placeholder="Antigravity prompt (e.g. run tests, inspect code...)" style="flex:1;min-width:260px">
+<select id=agent_provider style="font-weight:600;min-width:170px"></select>
+<input id=agyprompt placeholder="Agent prompt (e.g. run tests, inspect code...)" style="flex:1;min-width:260px">
 <button id=btn_bg>Background</button>
 <button id=btn_sync>Run Task</button>
 <button id=btn_term>Open Terminal</button>
 <span class="mut sm" id=agymsg></span>
 </div>
+<h2>supported providers <span class=mut id=pcount></span></h2>
+<div class=grid id=providers style="margin-bottom:12px"></div>
+<h2>tools (mcp) <span class=mut id=tcount></span></h2>
 <div class=grid id=tools style="margin-bottom:12px"></div>
 <h2>events</h2>
 <div class=bar>
@@ -391,11 +454,40 @@ async function pullState(){
  const sig=sendable.map(a=>a.id).join('|');
  if(sig!==sendSig){sendSig=sig;const cur=$('sagent').value;$('sagent').innerHTML=sendable.map(a=>`<option value="${esc(a.id)}">${esc(a.name)} (${esc(a.id)})</option>`).join('');if(cur)$('sagent').value=cur}
  const ts=JSON.stringify(s.tasks)+readOnly;
- if(ts!==tasksSig){tasksSig=ts;$('tasks').innerHTML=s.tasks.map(t=>`<tr><td>#${t.id}</td><td>${esc(t.agent_id)}</td><td class="${esc(t.status)}">${esc(t.status)}</td><td><details data-t="${t.id}" ${openT.has(String(t.id))?'open':''}><summary>${esc(t.text.slice(0,100))}</summary><pre>${esc(t.text)}</pre>${t.output?`<b>output</b><pre>${esc(t.output)}</pre>`:''}</details></td><td>${t.status==='pending'&&!readOnly?`<button data-cancel="${t.id}">cancel</button>`:''}</td></tr>`).join('')||'<tr><td class=mut>none</td></tr>'}}
+ if(ts!==tasksSig){tasksSig=ts;$('tasks').innerHTML=s.tasks.map(t=>`<tr><td>#${t.id}</td><td>${esc(t.agent_id)}</td><td class="${esc(t.status)}">${esc(t.status)}</td><td><details data-t="${t.id}" ${openT.has(String(t.id))?'open':''}><summary>${esc(t.text.slice(0,100))}</summary><pre>${esc(t.text)}</pre>${t.output?`<b>output</b><pre>${esc(t.output)}</pre>`:''}</details></td><td>${t.status==='pending'&&!readOnly?`<button data-cancel="${t.id}">cancel</button>`:''}</td></tr>`).join('')||'<tr><td class=mut>none</td></tr>'}
+ if(s.providers){
+  $('pcount').textContent='· '+s.providers.filter(p=>p.is_available).length+'/'+s.providers.length+' installed';
+  const sel=$('agent_provider');
+  const curP=sel.value;
+  const pOpts=s.providers.map(p=>`<option value="${esc(p.id)}"${!p.is_available?' disabled style="color:var(--mut)"':''}>${esc(p.name)} ${p.is_available?'✓ ('+esc(p.version||'ready')+')':'✗ [missing]'}</option>`).join('');
+  if(sel.innerHTML!==pOpts){
+   sel.innerHTML=pOpts;
+   if(curP && [...sel.options].some(o=>o.value===curP && !o.disabled)) sel.value=curP;
+   else {
+    const firstAvail = s.providers.find(p=>p.is_available);
+    if(firstAvail) sel.value=firstAvail.id;
+   }
+  }
+  $('providers').innerHTML=s.providers.map(p=>{
+   const caps=(p.capabilities||[]).map(c=>`<span class=tag style="font-size:10px;margin-right:2px">${esc(c)}</span>`).join('');
+   const stDot=`<span class="dot ${p.is_available?'on':''}"></span>`;
+   const verBadge=p.version?`<span class="tag done sm">${esc(p.version)}</span>`:(p.is_available?`<span class="tag done sm">ready</span>`:`<span class="tag sm" style="color:var(--mut)">not found</span>`);
+   const reason=p.unavailability_reason?`<div class="warn sm" style="margin-top:4px">${esc(p.unavailability_reason)}</div><div class="mut sm" style="margin-top:2px;font-size:11px">${esc(p.install_instructions||'')}</div>`:'';
+   return `<div class=card style="cursor:default">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+     <div>${stDot}<b>${esc(p.name)}</b> <span class="mut sm">(${esc(p.id)})</span></div>
+     ${verBadge}
+    </div>
+    <div class="mut sm" style="margin:4px 0 6px">${esc(p.description)}</div>
+    <div style="margin-top:4px">${caps}</div>
+    ${reason}
+   </div>`;
+  }).join('');
+ }
  if(s.tools){$('tcount').textContent='· '+s.tools.length+' available';
  $('tools').innerHTML=s.tools.map(t=>{const p=t.inputSchema&&t.inputSchema.properties||{};const req=new Set(t.inputSchema&&t.inputSchema.required||[]);
  const params=Object.keys(p).map(k=>`<span class=tag>${esc(k)}${req.has(k)?' *':''}</span> <span class="mut sm">${esc(p[k].description||p[k].type||'')}</span>`).join('<br>');
- return `<div class=card style="cursor:default"><b style="color:var(--acc)">${esc(t.name)}</b><div class="mut sm" style="margin:4px 0 6px">${esc(t.description)}</div>${params?`<details><summary class="sm mut">parameters</summary><div style="margin-top:4px">${params}</div></details>`:'<span class="sm mut">no parameters</span>'}</div>`}).join('')}
+ return `<div class=card style="cursor:default"><b style="color:var(--acc)">${esc(t.name)}</b><div class="mut sm" style="margin:4px 0 6px">${esc(t.description)}</div>${params?`<details><summary class="sm mut">parameters</summary><div style="margin-top:4px">${params}</div></details>`:'<span class="sm mut">no parameters</span>'}</div>`}).join('')}}
 async function tick(){try{await pullState();if(!$('pause').checked)await pullEvents(false);$('ts').textContent=new Date().toLocaleTimeString()}catch(e){$('ts').textContent='disconnected'}}
 $('agents').onclick=e=>{const c=e.target.closest('.card');if(!c)return;const id=c.dataset.id;agent=agent===id?'':id;
  $('filt').textContent=agent?'· filtering '+agent+' (click it again to clear)':'';pullEvents(true);pullState()};
@@ -412,12 +504,13 @@ async function runTool(name,args,msgId){
  const el=$(msgId);el.textContent='running '+name+'...';
  try{const r=await api('api/tool',{method:'POST',body:JSON.stringify({name,arguments:args})});
   if(r.error)el.textContent='error: '+r.error;
+  else if(r.result&&r.result.status==='unavailable')el.textContent='unavailable: '+(r.result.error||'CLI not found');
   else if(r.result&&r.result.output)el.textContent='completed: '+(r.result.output.slice(0,120));
   else el.textContent='status: '+(r.result&&r.result.status||'ok')+(r.result&&r.result.pid?' (PID '+r.result.pid+')':'');
   tick()}catch(e){el.textContent='failed: '+e.message}}
-$('btn_bg').onclick=()=>runTool('launch_antigravity_background',{prompt:$('agyprompt').value},'agymsg');
-$('btn_sync').onclick=()=>runTool('run_antigravity_task',{prompt:$('agyprompt').value},'agymsg');
-$('btn_term').onclick=()=>runTool('open_antigravity_terminal',{prompt:$('agyprompt').value},'agymsg');
+$('btn_bg').onclick=()=>runTool('launch_agent_background',{provider:$('agent_provider').value,prompt:$('agyprompt').value},'agymsg');
+$('btn_sync').onclick=()=>runTool('run_agent_task',{provider:$('agent_provider').value,prompt:$('agyprompt').value},'agymsg');
+$('btn_term').onclick=()=>runTool('open_agent_terminal',{provider:$('agent_provider').value,prompt:$('agyprompt').value},'agymsg');
 tick();setInterval(tick,2000);
 </script>"""
 
@@ -476,10 +569,17 @@ def make_handler(store, token, read_only):
             if rest == []:
                 return self._send(200, DASH, "text/html; charset=utf-8")
             if rest == ["api", "state"]:
-                out = {"read_only": read_only, "agents": store.agents(), "tasks": store.tasks(limit=30), "tools": tool_defs(read_only)}
+                out = {"read_only": read_only, "agents": store.agents(), "tasks": store.tasks(limit=30), "tools": tool_defs(read_only),
+                       "providers": [p.to_dict() for p in get_registry().list_providers()]}
                 if q.get("events", ["1"])[0] != "0":
                     out["events"] = store.events(limit=100)
                 return self._send(200, out)
+            if rest == ["api", "providers"]:
+                pid = q.get("provider", [None])[0]
+                providers = get_registry().list_providers()
+                if pid:
+                    providers = [p for p in providers if p.provider_id.lower() == str(pid).strip().lower()]
+                return self._send(200, {"providers": [p.to_dict() for p in providers]})
             if rest == ["api", "events"]:
                 def num(k, d):
                     try: return int(q.get(k, [d])[0])
